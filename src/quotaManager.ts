@@ -30,6 +30,17 @@ export interface LastExceededInfo {
   retryAfterSec?: number;
 }
 
+export type AuditEventType = 'config_update' | 'template_apply' | 'usage_reset' | 'quota_exceeded' | 'client_register';
+
+export interface AuditEntry {
+  id: number;
+  at: number;
+  atIso: string;
+  event: AuditEventType;
+  clientId: string;
+  detail: Record<string, any>;
+}
+
 export const TEMPLATES: Record<QuotaTemplate, Omit<ClientQuotaConfig, 'clientId'>> = {
   free: {
     maxConcurrentConnections: 10,
@@ -48,6 +59,8 @@ export const TEMPLATES: Record<QuotaTemplate, Omit<ClientQuotaConfig, 'clientId'
   default: { ...DEFAULT_QUOTA_CONFIG },
 };
 
+const MAX_AUDIT_ENTRIES = 1000;
+
 export class QuotaManager {
   private readonly store: QuotaStore;
   private readonly strategy: QuotaStrategyConfig;
@@ -57,6 +70,8 @@ export class QuotaManager {
   private readonly onQuotaExceeded?: (clientId: string, dimension: QuotaDimension, action: QuotaAction) => void;
   private readonly onDegrade?: (clientId: string, usageRatio: number, delayMs: number) => void;
   private readonly lastExceeded: Map<string, LastExceededInfo> = new Map();
+  private readonly auditLog: AuditEntry[] = [];
+  private auditCounter = 0;
 
   constructor(options: QuotaManagerOptions = {}) {
     this.store = options.store ?? new LocalQuotaStore();
@@ -67,11 +82,42 @@ export class QuotaManager {
     this.onDegrade = options.onDegrade;
   }
 
+  private addAudit(event: AuditEventType, clientId: string, detail: Record<string, any>): void {
+    const now = Date.now();
+    const entry: AuditEntry = {
+      id: ++this.auditCounter,
+      at: now,
+      atIso: new Date(now).toISOString(),
+      event,
+      clientId,
+      detail,
+    };
+    this.auditLog.push(entry);
+    if (this.auditLog.length > MAX_AUDIT_ENTRIES) {
+      this.auditLog.splice(0, this.auditLog.length - MAX_AUDIT_ENTRIES);
+    }
+  }
+
+  getAuditLog(options?: { clientId?: string; event?: AuditEventType; limit?: number; offset?: number }): AuditEntry[] {
+    let entries = this.auditLog;
+    if (options?.clientId) {
+      entries = entries.filter(e => e.clientId === options.clientId);
+    }
+    if (options?.event) {
+      entries = entries.filter(e => e.event === options.event);
+    }
+    entries = entries.slice().reverse();
+    const offset = options?.offset ?? 0;
+    const limit = options?.limit ?? 50;
+    return entries.slice(offset, offset + limit);
+  }
+
   registerClient(config: Partial<ClientQuotaConfig> & { clientId: string }): void {
     this.clientConfigs.set(config.clientId, {
       ...this.defaultConfig,
       ...config,
     });
+    this.addAudit('client_register', config.clientId, { config: this.clientConfigs.get(config.clientId) });
   }
 
   applyTemplate(clientId: string, template: QuotaTemplate | 'custom', customConfig?: UpdateQuotaPatch): ClientQuotaConfig {
@@ -87,6 +133,7 @@ export class QuotaManager {
       clientId,
     };
     this.clientConfigs.set(clientId, merged);
+    this.addAudit('template_apply', clientId, { template, customConfig, resultConfig: merged });
     return merged;
   }
 
@@ -94,6 +141,7 @@ export class QuotaManager {
     const existing = this.getClientConfig(clientId);
     const updated = { ...existing, ...patch };
     this.clientConfigs.set(clientId, updated);
+    this.addAudit('config_update', clientId, { patch, previousConfig: existing, newConfig: updated });
     return updated;
   }
 
@@ -104,12 +152,24 @@ export class QuotaManager {
     };
   }
 
+  isClientRegistered(clientId: string): boolean {
+    return this.clientConfigs.has(clientId);
+  }
+
   getAllClientIds(): string[] {
     return Array.from(this.clientConfigs.keys());
   }
 
+  ensureClientRegistered(clientId: string): void {
+    if (!this.clientConfigs.has(clientId)) {
+      this.clientConfigs.set(clientId, { ...this.defaultConfig, clientId });
+      this.addAudit('client_register', clientId, { source: 'auto', config: this.defaultConfig });
+    }
+  }
+
   private trackExceeded(clientId: string, dimension: QuotaDimension, action: QuotaAction, retryAfterSec?: number): void {
     this.lastExceeded.set(clientId, { dimension, action, at: Date.now(), retryAfterSec });
+    this.addAudit('quota_exceeded', clientId, { dimension, action, retryAfterSec });
   }
 
   getLastExceeded(clientId: string): LastExceededInfo | undefined {
@@ -118,6 +178,7 @@ export class QuotaManager {
 
   async resetUsage(clientId: string): Promise<void> {
     await this.store.resetClient(clientId);
+    this.addAudit('usage_reset', clientId, {});
   }
 
   async addResponseTraffic(clientId: string, bytes: number): Promise<void> {
@@ -179,6 +240,7 @@ export class QuotaManager {
     clientId: string,
     payloadBytes: number = 0,
   ): Promise<QuotaCheckResult & { action: QuotaAction; delayMs: number }> {
+    this.ensureClientRegistered(clientId);
     const config = this.getClientConfig(clientId);
 
     const concurrentResult = await this.store.acquireConnection(
@@ -384,9 +446,12 @@ export class QuotaManager {
   }
 
   async listAllUsage() {
-    const ids = this.getAllClientIds();
+    const configuredIds = new Set(this.clientConfigs.keys());
+    const activeIds = await this.store.getActiveClientIds();
+    const allIds = new Set([...configuredIds, ...activeIds]);
+
     const result = [];
-    for (const id of ids) {
+    for (const id of allIds) {
       result.push(await this.getUsage(id));
     }
     return result;

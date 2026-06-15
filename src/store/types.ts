@@ -68,6 +68,7 @@ export interface QuotaStore {
     trafficHourUsed: number;
     trafficDayUsed: number;
   }>;
+  getActiveClientIds(): Promise<string[]>;
   resetClient(clientId: string): Promise<void>;
   cleanup(): Promise<void>;
 }

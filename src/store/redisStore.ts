@@ -2,6 +2,7 @@ import Redis, { Redis as RedisType, RedisOptions } from 'ioredis';
 import { QuotaStore, ConsumeRequestResult, AcquireConnectionResult, ReleaseConnectionResult } from './types';
 
 export interface RedisQuotaStoreOptions {
+  redisUrl?: string;
   redisOptions?: RedisOptions;
   redisClient?: RedisType;
   syncIntervalMs?: number;
@@ -108,6 +109,9 @@ export class RedisQuotaStore implements QuotaStore {
     if (options.redisClient) {
       this.client = options.redisClient;
       this.ownClient = false;
+    } else if (options.redisUrl) {
+      this.client = new Redis(options.redisUrl);
+      this.ownClient = true;
     } else {
       this.client = new Redis(options.redisOptions ?? {});
       this.ownClient = true;
@@ -487,6 +491,17 @@ export class RedisQuotaStore implements QuotaStore {
         trafficHourUsed: 0,
         trafficDayUsed: 0,
       };
+    }
+  }
+
+  async getActiveClientIds(): Promise<string[]> {
+    try {
+      const pattern = `${this.keyPrefix}:conn:*`;
+      const keys = await this.client.keys(pattern);
+      const prefixLen = `${this.keyPrefix}:conn:`.length;
+      return keys.map(k => k.slice(prefixLen)).filter(Boolean);
+    } catch (e) {
+      return [];
     }
   }
 

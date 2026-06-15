@@ -234,6 +234,13 @@ export class LocalQuotaStore implements QuotaStore {
     };
   }
 
+  async getActiveClientIds(): Promise<string[]> {
+    const ids = new Set<string>();
+    for (const id of this.clients.keys()) ids.add(id);
+    for (const id of this.concurrentCounts.keys()) ids.add(id);
+    return Array.from(ids);
+  }
+
   async resetClient(clientId: string): Promise<void> {
     this.concurrentCounts.delete(clientId);
     const state = this.clients.get(clientId);
