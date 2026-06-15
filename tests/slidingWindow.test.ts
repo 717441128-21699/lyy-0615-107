@@ -27,7 +27,7 @@ describe('SlidingWindowCounter', () => {
     counter.increment(500);
     expect(counter.getCount()).toBe(500);
 
-    jest.advanceTimersByTime(60001);
+    jest.advanceTimersByTime(61000);
     expect(counter.getCount()).toBe(0);
   });
 

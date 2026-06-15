@@ -64,7 +64,7 @@ export function createQuotaMiddleware(options: QuotaMiddlewareOptions) {
     try {
       const result = await quotaManager.checkAndConsume(clientId, payloadBytes);
 
-      const headers = result.headers as Record<string, string | number | undefined>;
+      const headers = result.headers as unknown as Record<string, string | number | undefined>;
       for (const [key, value] of Object.entries(headers)) {
         if (value !== undefined && value !== null) {
           res.setHeader(key, String(value));
@@ -116,20 +116,20 @@ export function createQuotaMiddleware(options: QuotaMiddlewareOptions) {
         await sleep(result.throttleDelayMs);
       }
 
-      const originalEnd = res.end.bind(res);
+      const originalEnd = res.end.bind(res) as any;
       let responseSize = 0;
-      const originalWrite = res.write.bind(res);
+      const originalWrite = res.write.bind(res) as any;
 
-      res.write = function (chunk: any, encoding?: any, cb?: any) {
+      (res as any).write = function (chunk: any, encoding?: any, cb?: any) {
         if (chunk) {
           responseSize += typeof chunk === 'string'
             ? Buffer.byteLength(chunk, typeof encoding === 'string' ? encoding as BufferEncoding : 'utf-8')
             : (Buffer.isBuffer(chunk) ? chunk.length : 0);
         }
-        return originalWrite(chunk, encoding as any, cb as any);
+        return originalWrite(chunk, encoding, cb);
       };
 
-      res.end = function (chunk: any, encoding?: any, cb?: any) {
+      (res as any).end = function (chunk: any, encoding?: any, cb?: any) {
         if (chunk) {
           responseSize += typeof chunk === 'string'
             ? Buffer.byteLength(chunk, typeof encoding === 'string' ? encoding as BufferEncoding : 'utf-8')
@@ -137,7 +137,7 @@ export function createQuotaMiddleware(options: QuotaMiddlewareOptions) {
         }
         res.setHeader('X-Quota-Response-Bytes', String(responseSize));
         quotaManager.releaseConnection(clientId).catch(() => {});
-        return originalEnd(chunk, encoding as any, cb as any);
+        return originalEnd(chunk, encoding, cb);
       };
 
       next();

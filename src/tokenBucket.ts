@@ -30,7 +30,7 @@ export class TokenBucket {
     }
 
     const deficit = tokens - this.state.tokens;
-    const waitTimeMs = Math.ceil((deficit / this.refillRatePerSecond) * 1000;
+    const waitTimeMs = Math.ceil((deficit / this.refillRatePerSecond) * 1000);
     return {
       allowed: false,
       waitTimeMs,

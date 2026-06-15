@@ -5,6 +5,7 @@ import { SlidingWindowCounter } from '../slidingWindow';
 export class LocalQuotaStore implements QuotaStore {
   readonly mode = 'local' as const;
   private clients: Map<string, ClientState> = new Map();
+  private concurrentCounts: Map<string, number> = new Map();
   private readonly ttlMs: number;
   private cleanupTimer?: NodeJS.Timeout;
 
@@ -17,8 +18,10 @@ export class LocalQuotaStore implements QuotaStore {
     this.cleanupTimer = setInterval(() => {
       const now = Date.now();
       for (const [clientId, state] of this.clients) {
-        if (now - state.lastAccess > this.ttlMs && state.concurrentConnections === 0) {
+        const concurrent = this.concurrentCounts.get(clientId) ?? 0;
+        if (now - state.lastAccess > this.ttlMs && concurrent === 0) {
           this.clients.delete(clientId);
+          this.concurrentCounts.delete(clientId);
         }
       }
     }, Math.max(60_000, this.ttlMs / 4));
@@ -48,21 +51,19 @@ export class LocalQuotaStore implements QuotaStore {
   }
 
   async acquireConnection(clientId: string, limit: number): Promise<AcquireConnectionResult> {
-    const state = this.getOrCreateState(clientId, 1, 1);
-    if (state.concurrentConnections >= limit) {
-      return { acquired: false, current: state.concurrentConnections, limit };
+    const current = this.concurrentCounts.get(clientId) ?? 0;
+    if (current >= limit) {
+      return { acquired: false, current, limit };
     }
-    state.concurrentConnections++;
-    return { acquired: true, current: state.concurrentConnections, limit };
+    this.concurrentCounts.set(clientId, current + 1);
+    return { acquired: true, current: current + 1, limit };
   }
 
   async releaseConnection(clientId: string): Promise<ReleaseConnectionResult> {
-    const state = this.clients.get(clientId);
-    if (!state) {
-      return { current: 0 };
-    }
-    state.concurrentConnections = Math.max(0, state.concurrentConnections - 1);
-    return { current: state.concurrentConnections };
+    const current = this.concurrentCounts.get(clientId) ?? 0;
+    const newCount = Math.max(0, current - 1);
+    this.concurrentCounts.set(clientId, newCount);
+    return { current: newCount };
   }
 
   async consumeRequest(
@@ -74,6 +75,7 @@ export class LocalQuotaStore implements QuotaStore {
     payloadBytes: number = 0,
   ): Promise<ConsumeRequestResult> {
     const state = this.getOrCreateState(clientId, rateLimit, rateBurst);
+    const concurrentCurrent = this.concurrentCounts.get(clientId) ?? 0;
 
     const rateResult = state.tokenBucket.tryConsume(1);
     if (!rateResult.allowed) {
@@ -83,7 +85,7 @@ export class LocalQuotaStore implements QuotaStore {
         allowed: false,
         blockedDimension: 'requestsPerSecond',
         throttleDelayMs: rateResult.waitTimeMs,
-        concurrentCurrent: state.concurrentConnections,
+        concurrentCurrent,
         concurrentLimit: 0,
         rateRemaining: Math.floor(rateResult.remaining),
         rateLimit: rateLimit,
@@ -109,7 +111,7 @@ export class LocalQuotaStore implements QuotaStore {
       return {
         allowed: false,
         blockedDimension: 'bytesPerHour',
-        concurrentCurrent: state.concurrentConnections,
+        concurrentCurrent,
         concurrentLimit: 0,
         rateRemaining: Math.floor(rateResult.remaining),
         rateLimit: rateLimit,
@@ -127,7 +129,7 @@ export class LocalQuotaStore implements QuotaStore {
       return {
         allowed: false,
         blockedDimension: 'bytesPerDay',
-        concurrentCurrent: state.concurrentConnections,
+        concurrentCurrent,
         concurrentLimit: 0,
         rateRemaining: Math.floor(rateResult.remaining),
         rateLimit: rateLimit,
@@ -148,7 +150,7 @@ export class LocalQuotaStore implements QuotaStore {
 
     return {
       allowed: true,
-      concurrentCurrent: state.concurrentConnections,
+      concurrentCurrent,
       concurrentLimit: 0,
       rateRemaining: Math.floor(rateResult.remaining),
       rateLimit: rateLimit,
@@ -165,7 +167,7 @@ export class LocalQuotaStore implements QuotaStore {
     const state = this.clients.get(clientId);
     if (!state) {
       return {
-        concurrent: 0,
+        concurrent: this.concurrentCounts.get(clientId) ?? 0,
         rateRemaining: 0,
         trafficHourRemaining: 0,
         trafficDayRemaining: 0,
@@ -174,7 +176,7 @@ export class LocalQuotaStore implements QuotaStore {
     const { count: hourCount } = state.trafficHour.getApproximateCount();
     const { count: dayCount } = state.trafficDay.getApproximateCount();
     return {
-      concurrent: state.concurrentConnections,
+      concurrent: this.concurrentCounts.get(clientId) ?? 0,
       rateRemaining: Math.floor(state.tokenBucket.peekRemaining()),
       trafficHourRemaining: Math.max(0, hourCount),
       trafficDayRemaining: Math.max(0, dayCount),
@@ -183,6 +185,7 @@ export class LocalQuotaStore implements QuotaStore {
 
   async resetClient(clientId: string): Promise<void> {
     this.clients.delete(clientId);
+    this.concurrentCounts.delete(clientId);
   }
 
   async cleanup(): Promise<void> {
@@ -191,5 +194,6 @@ export class LocalQuotaStore implements QuotaStore {
       this.cleanupTimer = undefined;
     }
     this.clients.clear();
+    this.concurrentCounts.clear();
   }
 }

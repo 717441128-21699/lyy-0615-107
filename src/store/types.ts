@@ -1,5 +1,5 @@
-import { TokenBucket } from './tokenBucket';
-import { SlidingWindowCounter } from './slidingWindow';
+import { TokenBucket } from '../tokenBucket';
+import { SlidingWindowCounter } from '../slidingWindow';
 
 export interface ClientState {
   clientId: string;
