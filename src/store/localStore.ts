@@ -178,6 +178,42 @@ export class LocalQuotaStore implements QuotaStore {
     );
   }
 
+  async addTraffic(
+    clientId: string,
+    bytesPerHour: number,
+    bytesPerDay: number,
+    bytes: number,
+  ): Promise<{ hourUsed: number; dayUsed: number; hourExceeded: boolean; dayExceeded: boolean }> {
+    if (bytes <= 0) {
+      const state = this.clients.get(clientId);
+      if (!state) {
+        return { hourUsed: 0, dayUsed: 0, hourExceeded: false, dayExceeded: false };
+      }
+      const { count: hourUsed } = state.trafficHour.getApproximateCount();
+      const { count: dayUsed } = state.trafficDay.getApproximateCount();
+      return {
+        hourUsed,
+        dayUsed,
+        hourExceeded: hourUsed >= bytesPerHour,
+        dayExceeded: dayUsed >= bytesPerDay,
+      };
+    }
+
+    const state = this.getOrCreateState(clientId, 1, 1);
+    state.trafficHour.increment(bytes);
+    state.trafficDay.increment(bytes);
+
+    const { count: hourUsed } = state.trafficHour.getApproximateCount();
+    const { count: dayUsed } = state.trafficDay.getApproximateCount();
+
+    return {
+      hourUsed,
+      dayUsed,
+      hourExceeded: hourUsed >= bytesPerHour,
+      dayExceeded: dayUsed >= bytesPerDay,
+    };
+  }
+
   async getCurrentUsage(clientId: string) {
     const state = this.clients.get(clientId);
     if (!state) {
@@ -199,8 +235,14 @@ export class LocalQuotaStore implements QuotaStore {
   }
 
   async resetClient(clientId: string): Promise<void> {
-    this.clients.delete(clientId);
     this.concurrentCounts.delete(clientId);
+    const state = this.clients.get(clientId);
+    if (state) {
+      state.tokenBucket.resetToFull();
+      state.trafficHour.reset();
+      state.trafficDay.reset();
+      state.lastAccess = Date.now();
+    }
   }
 
   async cleanup(): Promise<void> {

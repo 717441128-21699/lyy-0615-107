@@ -67,4 +67,9 @@ export class TokenBucket {
     if (deficit <= 0) return 0;
     return Math.ceil(deficit / this.refillRatePerSecond) * 1000;
   }
+
+  resetToFull(): void {
+    this.state.tokens = this.capacity;
+    this.state.lastRefillTimestamp = Date.now();
+  }
 }

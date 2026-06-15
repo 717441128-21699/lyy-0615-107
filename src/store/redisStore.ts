@@ -32,6 +32,7 @@ last_refill = tonumber(last_refill)
 local current_tokens = redis.call('GET', tokens_key)
 if current_tokens == false then current_tokens = capacity end
 current_tokens = tonumber(current_tokens)
+if current_tokens > capacity then current_tokens = capacity end
 
 local elapsed = (now - last_refill) / 1000
 if elapsed > 0 then
@@ -77,6 +78,7 @@ last_refill = tonumber(last_refill)
 local current_tokens = redis.call('GET', tokens_key)
 if current_tokens == false then current_tokens = capacity end
 current_tokens = tonumber(current_tokens)
+if current_tokens > capacity then current_tokens = capacity end
 
 local elapsed = (now - last_refill) / 1000
 if elapsed > 0 then
@@ -424,6 +426,42 @@ export class RedisQuotaStore implements QuotaStore {
     }
   }
 
+  async addTraffic(
+    clientId: string,
+    bytesPerHour: number,
+    bytesPerDay: number,
+    bytes: number,
+  ): Promise<{ hourUsed: number; dayUsed: number; hourExceeded: boolean; dayExceeded: boolean }> {
+    const trafficHourKey = KEYS.trafficHour(this.keyPrefix, clientId);
+    const trafficDayKey = KEYS.trafficDay(this.keyPrefix, clientId);
+    const now = Date.now();
+    const currentHourBucket = Math.floor(now / 10_000);
+    const currentDayBucket = Math.floor(now / 60_000);
+
+    try {
+      if (bytes > 0) {
+        const pipeline = this.client.pipeline();
+        pipeline.hincrby(trafficHourKey, currentHourBucket.toString(), bytes);
+        pipeline.hincrby(trafficDayKey, currentDayBucket.toString(), bytes);
+        pipeline.expire(trafficHourKey, 3700);
+        pipeline.expire(trafficDayKey, 86500);
+        await pipeline.exec();
+      }
+
+      const hourCount = await this.sumTrafficBuckets(trafficHourKey, 360, currentHourBucket);
+      const dayCount = await this.sumTrafficBuckets(trafficDayKey, 1440, currentDayBucket);
+
+      return {
+        hourUsed: hourCount,
+        dayUsed: dayCount,
+        hourExceeded: hourCount >= bytesPerHour,
+        dayExceeded: dayCount >= bytesPerDay,
+      };
+    } catch (e) {
+      return { hourUsed: 0, dayUsed: 0, hourExceeded: false, dayExceeded: false };
+    }
+  }
+
   async getCurrentUsage(clientId: string) {
     try {
       const concurrent = parseInt(await this.client.get(KEYS.concurrent(this.keyPrefix, clientId)) ?? '0', 10);
@@ -453,14 +491,22 @@ export class RedisQuotaStore implements QuotaStore {
   }
 
   async resetClient(clientId: string): Promise<void> {
-    const keys = [
-      KEYS.concurrent(this.keyPrefix, clientId),
-      KEYS.tokens(this.keyPrefix, clientId),
-      KEYS.tokensRefill(this.keyPrefix, clientId),
-      KEYS.trafficHour(this.keyPrefix, clientId),
-      KEYS.trafficDay(this.keyPrefix, clientId),
-    ];
-    await this.client.del(...keys);
+    const concurrentKey = KEYS.concurrent(this.keyPrefix, clientId);
+    const tokensKey = KEYS.tokens(this.keyPrefix, clientId);
+    const refillKey = KEYS.tokensRefill(this.keyPrefix, clientId);
+    const trafficHourKey = KEYS.trafficHour(this.keyPrefix, clientId);
+    const trafficDayKey = KEYS.trafficDay(this.keyPrefix, clientId);
+
+    try {
+      const pipeline = this.client.pipeline();
+      pipeline.del(concurrentKey);
+      pipeline.set(tokensKey, '1000000');
+      pipeline.set(refillKey, String(Date.now()));
+      pipeline.del(trafficHourKey);
+      pipeline.del(trafficDayKey);
+      await pipeline.exec();
+    } catch (e) {
+    }
   }
 
   async cleanup(): Promise<void> {

@@ -21,6 +21,33 @@ export interface QuotaManagerOptions {
 
 export type UpdateQuotaPatch = Partial<Omit<ClientQuotaConfig, 'clientId'>>;
 
+export type QuotaTemplate = 'free' | 'vip' | 'default';
+
+export interface LastExceededInfo {
+  dimension: QuotaDimension;
+  action: QuotaAction;
+  at: number;
+  retryAfterSec?: number;
+}
+
+export const TEMPLATES: Record<QuotaTemplate, Omit<ClientQuotaConfig, 'clientId'>> = {
+  free: {
+    maxConcurrentConnections: 10,
+    requestsPerSecond: 10,
+    requestsBurst: 30,
+    bytesPerHour: 10 * 1024 * 1024,
+    bytesPerDay: 100 * 1024 * 1024,
+  },
+  vip: {
+    maxConcurrentConnections: 200,
+    requestsPerSecond: 200,
+    requestsBurst: 500,
+    bytesPerHour: 500 * 1024 * 1024,
+    bytesPerDay: 10 * 1024 * 1024 * 1024,
+  },
+  default: { ...DEFAULT_QUOTA_CONFIG },
+};
+
 export class QuotaManager {
   private readonly store: QuotaStore;
   private readonly strategy: QuotaStrategyConfig;
@@ -29,6 +56,7 @@ export class QuotaManager {
   private readonly getRequestPayloadBytes: (req: any) => number;
   private readonly onQuotaExceeded?: (clientId: string, dimension: QuotaDimension, action: QuotaAction) => void;
   private readonly onDegrade?: (clientId: string, usageRatio: number, delayMs: number) => void;
+  private readonly lastExceeded: Map<string, LastExceededInfo> = new Map();
 
   constructor(options: QuotaManagerOptions = {}) {
     this.store = options.store ?? new LocalQuotaStore();
@@ -46,6 +74,22 @@ export class QuotaManager {
     });
   }
 
+  applyTemplate(clientId: string, template: QuotaTemplate | 'custom', customConfig?: UpdateQuotaPatch): ClientQuotaConfig {
+    let base: Omit<ClientQuotaConfig, 'clientId'>;
+    if (template === 'custom') {
+      base = { ...this.getClientConfig(clientId) };
+    } else {
+      base = { ...TEMPLATES[template] };
+    }
+    const merged: ClientQuotaConfig = {
+      ...base,
+      ...(customConfig ?? {}),
+      clientId,
+    };
+    this.clientConfigs.set(clientId, merged);
+    return merged;
+  }
+
   updateClientConfig(clientId: string, patch: UpdateQuotaPatch): ClientQuotaConfig {
     const existing = this.getClientConfig(clientId);
     const updated = { ...existing, ...patch };
@@ -58,6 +102,38 @@ export class QuotaManager {
       ...this.defaultConfig,
       clientId,
     };
+  }
+
+  getAllClientIds(): string[] {
+    return Array.from(this.clientConfigs.keys());
+  }
+
+  private trackExceeded(clientId: string, dimension: QuotaDimension, action: QuotaAction, retryAfterSec?: number): void {
+    this.lastExceeded.set(clientId, { dimension, action, at: Date.now(), retryAfterSec });
+  }
+
+  getLastExceeded(clientId: string): LastExceededInfo | undefined {
+    return this.lastExceeded.get(clientId);
+  }
+
+  async resetUsage(clientId: string): Promise<void> {
+    await this.store.resetClient(clientId);
+  }
+
+  async addResponseTraffic(clientId: string, bytes: number): Promise<void> {
+    if (bytes <= 0) return;
+    const config = this.getClientConfig(clientId);
+    const result = await this.store.addTraffic(
+      clientId,
+      config.bytesPerHour,
+      config.bytesPerDay,
+      bytes,
+    );
+    if (result.hourExceeded) {
+      this.trackExceeded(clientId, 'bytesPerHour', 'reject');
+    } else if (result.dayExceeded) {
+      this.trackExceeded(clientId, 'bytesPerDay', 'reject');
+    }
   }
 
   private buildHeaders(
@@ -111,6 +187,7 @@ export class QuotaManager {
     );
 
     if (!concurrentResult.acquired) {
+      this.trackExceeded(clientId, 'concurrentConnections', 'reject', 1);
       if (this.onQuotaExceeded) {
         this.onQuotaExceeded(clientId, 'concurrentConnections', 'reject');
       }
@@ -157,12 +234,12 @@ export class QuotaManager {
       this.onDegrade(clientId, usageRatio, delayMs);
     }
 
-    if (action === 'reject' && consumeResult.blockedDimension && this.onQuotaExceeded) {
-      this.onQuotaExceeded(
-        clientId,
-        consumeResult.blockedDimension as QuotaDimension,
-        'reject',
-      );
+    if (action === 'reject' && consumeResult.blockedDimension) {
+      const dim = consumeResult.blockedDimension as QuotaDimension;
+      this.trackExceeded(clientId, dim, 'reject', consumeResult.retryAfterSec);
+      if (this.onQuotaExceeded) {
+        this.onQuotaExceeded(clientId, dim, 'reject');
+      }
     }
 
     if (action === 'reject') {
@@ -234,30 +311,85 @@ export class QuotaManager {
   async getUsage(clientId: string) {
     const config = this.getClientConfig(clientId);
     const usage = await this.store.getCurrentUsage(clientId);
+    const peek = await this.store.peekRequest(
+      clientId,
+      config.requestsPerSecond,
+      config.requestsBurst,
+      config.bytesPerHour,
+      config.bytesPerDay,
+    );
+
+    const safeRateRemaining = Math.min(
+      Math.max(peek.rateRemaining, 0),
+      config.requestsBurst,
+    );
+    const rateCurrent = config.requestsBurst - safeRateRemaining;
+
+    const hourUsed = Math.min(usage.trafficHourUsed, config.bytesPerHour);
+    const dayUsed = Math.min(usage.trafficDayUsed, config.bytesPerDay);
+    const currentConcurrent = Math.min(usage.concurrent, config.maxConcurrentConnections);
+
+    const concurrentRemaining = Math.max(0, config.maxConcurrentConnections - currentConcurrent);
+    const trafficHourRemaining = Math.max(0, config.bytesPerHour - hourUsed);
+    const trafficDayRemaining = Math.max(0, config.bytesPerDay - dayUsed);
+
+    const concurrentRatio = config.maxConcurrentConnections > 0
+      ? currentConcurrent / config.maxConcurrentConnections
+      : 0;
+    const rateRatio = config.requestsBurst > 0
+      ? rateCurrent / config.requestsBurst
+      : 0;
+    const trafficHourRatio = config.bytesPerHour > 0
+      ? hourUsed / config.bytesPerHour
+      : 0;
+    const trafficDayRatio = config.bytesPerDay > 0
+      ? dayUsed / config.bytesPerDay
+      : 0;
+
+    const exceeded = this.getLastExceeded(clientId);
+
     return {
+      clientId,
       config,
-      usage,
+      usage: {
+        concurrent: currentConcurrent,
+        rateRemaining: safeRateRemaining,
+        rateCurrent,
+        trafficHourUsed: hourUsed,
+        trafficDayUsed: dayUsed,
+      },
       remaining: {
-        concurrent: Math.max(0, config.maxConcurrentConnections - usage.concurrent),
-        rate: usage.rateRemaining,
-        trafficHour: Math.max(0, config.bytesPerHour - usage.trafficHourUsed),
-        trafficDay: Math.max(0, config.bytesPerDay - usage.trafficDayUsed),
+        concurrent: concurrentRemaining,
+        rate: safeRateRemaining,
+        trafficHour: trafficHourRemaining,
+        trafficDay: trafficDayRemaining,
       },
       ratios: {
-        concurrent: config.maxConcurrentConnections > 0
-          ? usage.concurrent / config.maxConcurrentConnections
-          : 0,
-        rate: config.requestsBurst > 0
-          ? (config.requestsBurst - usage.rateRemaining) / config.requestsBurst
-          : 0,
-        trafficHour: config.bytesPerHour > 0
-          ? usage.trafficHourUsed / config.bytesPerHour
-          : 0,
-        trafficDay: config.bytesPerDay > 0
-          ? usage.trafficDayUsed / config.bytesPerDay
-          : 0,
+        concurrent: concurrentRatio,
+        rate: rateRatio,
+        trafficHour: trafficHourRatio,
+        trafficDay: trafficDayRatio,
+        max: Math.max(concurrentRatio, rateRatio, trafficHourRatio, trafficDayRatio),
       },
+      lastExceeded: exceeded
+        ? {
+            dimension: exceeded.dimension,
+            action: exceeded.action,
+            at: exceeded.at,
+            atIso: new Date(exceeded.at).toISOString(),
+            retryAfterSec: exceeded.retryAfterSec,
+          }
+        : null,
     };
+  }
+
+  async listAllUsage() {
+    const ids = this.getAllClientIds();
+    const result = [];
+    for (const id of ids) {
+      result.push(await this.getUsage(id));
+    }
+    return result;
   }
 
   async cleanup(): Promise<void> {

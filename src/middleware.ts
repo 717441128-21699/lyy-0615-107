@@ -205,6 +205,7 @@ export function createQuotaMiddleware(options: QuotaMiddlewareOptions) {
             : (Buffer.isBuffer(chunk) ? chunk.length : 0);
         }
         res.setHeader('X-Quota-Response-Bytes', String(responseSize));
+        quotaManager.addResponseTraffic(clientId, responseSize).catch(() => {});
         quotaManager.releaseConnection(clientId).catch(() => {});
         return originalEnd(chunk, encoding, cb);
       };

@@ -56,6 +56,12 @@ export interface QuotaStore {
     bytesPerHour: number,
     bytesPerDay: number,
   ): Promise<ConsumeRequestResult>;
+  addTraffic(
+    clientId: string,
+    bytesPerHour: number,
+    bytesPerDay: number,
+    bytes: number,
+  ): Promise<{ hourUsed: number; dayUsed: number; hourExceeded: boolean; dayExceeded: boolean }>;
   getCurrentUsage(clientId: string): Promise<{
     concurrent: number;
     rateRemaining: number;

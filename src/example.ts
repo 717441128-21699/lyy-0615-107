@@ -1,8 +1,8 @@
 import express from 'express';
-import { QuotaManager, UpdateQuotaPatch } from './quotaManager';
+import { QuotaManager, UpdateQuotaPatch, QuotaTemplate, TEMPLATES } from './quotaManager';
 import { LocalQuotaStore } from './store/localStore';
 import { RedisQuotaStore } from './store/redisStore';
-import { createQuotaMiddleware, QuotaErrorResponse } from './middleware';
+import { createQuotaMiddleware } from './middleware';
 import { QuotaStore } from './store/types';
 
 function createStore(): QuotaStore {
@@ -25,7 +25,6 @@ function createStore(): QuotaStore {
         password: process.env.REDIS_PASSWORD,
         db: parseInt(process.env.REDIS_DB ?? '0', 10),
       },
-      redisClient: redisUrl ? undefined : undefined,
       keyPrefix,
       localCacheTtlMs: parseInt(process.env.REDIS_CACHE_TTL_MS ?? '50', 10),
     });
@@ -35,11 +34,16 @@ function createStore(): QuotaStore {
   return new LocalQuotaStore();
 }
 
+function getInstanceId(): string {
+  return process.env.INSTANCE_ID ?? `instance-${process.pid}`;
+}
+
 async function main() {
   const app = express();
   app.use(express.json());
 
   const store = createStore();
+  const instanceId = getInstanceId();
 
   const quotaManager = new QuotaManager({
     store,
@@ -50,10 +54,10 @@ async function main() {
       enableDegradation: true,
     },
     onQuotaExceeded: (clientId, dimension, action) => {
-      console.log(`[Quota Exceeded] client=${clientId} dimension=${dimension} action=${action}`);
+      console.log(`[${instanceId}] [Quota Exceeded] client=${clientId} dimension=${dimension} action=${action}`);
     },
     onDegrade: (clientId, usageRatio, delayMs) => {
-      console.log(`[Quota Degrade] client=${clientId} ratio=${usageRatio.toFixed(2)} delay=${delayMs}ms`);
+      console.log(`[${instanceId}] [Quota Degrade] client=${clientId} ratio=${usageRatio.toFixed(2)} delay=${delayMs}ms`);
     },
   });
 
@@ -107,12 +111,19 @@ async function main() {
     }
   }
 
+  app.use((req, res, next) => {
+    res.setHeader('X-Instance-Id', instanceId);
+    res.setHeader('X-Quota-Store-Mode', quotaManager.getStoreMode());
+    next();
+  });
+
   app.get('/health', async (req, res) => {
     const clientId = extractClientId(req);
     await setQuotaHeaders(res, clientId);
     res.json({
       status: 'ok',
       mode: quotaManager.getStoreMode(),
+      instanceId,
       clientId,
     });
   });
@@ -120,7 +131,23 @@ async function main() {
   app.get('/api/usage', async (req, res) => {
     const clientId = extractClientId(req);
     const info = await quotaManager.getUsage(clientId);
-    res.json(info);
+    res.json({ ...info, instanceId });
+  });
+
+  app.get('/admin/quota', async (_req, res) => {
+    const all = await quotaManager.listAllUsage();
+    res.json({
+      instanceId,
+      mode: quotaManager.getStoreMode(),
+      total: all.length,
+      clients: all,
+    });
+  });
+
+  app.get('/admin/quota/:clientId', async (req, res) => {
+    const clientId = req.params.clientId;
+    const info = await quotaManager.getUsage(clientId);
+    res.json({ ...info, instanceId });
   });
 
   app.patch('/admin/quota/:clientId', async (req, res) => {
@@ -155,20 +182,61 @@ async function main() {
 
     res.json({
       message: '配额配置已更新',
+      instanceId,
       clientId,
       config: updatedConfig,
       currentUsage: usage,
     });
   });
 
-  app.get('/admin/quota/:clientId', async (req, res) => {
+  app.post('/admin/quota/:clientId/apply-template', async (req, res) => {
     const clientId = req.params.clientId;
-    const config = quotaManager.getClientConfig(clientId);
+    const { template, custom } = req.body as { template?: QuotaTemplate | 'custom'; custom?: UpdateQuotaPatch };
+
+    const validTemplates: (QuotaTemplate | 'custom')[] = ['free', 'vip', 'default', 'custom'];
+    if (!template || !validTemplates.includes(template)) {
+      res.status(400).json({
+        error: 'Bad Request',
+        message: `无效的模板类型，支持：${validTemplates.join(', ')}`,
+        availableTemplates: {
+          free: TEMPLATES.free,
+          vip: TEMPLATES.vip,
+          default: TEMPLATES.default,
+          custom: '基于当前配置叠加 custom 字段',
+        },
+      });
+      return;
+    }
+
+    const updatedConfig = quotaManager.applyTemplate(clientId, template, custom);
+    const usage = await quotaManager.getUsage(clientId);
+
+    res.json({
+      message: `已套用模板: ${template}`,
+      instanceId,
+      clientId,
+      appliedTemplate: template,
+      config: updatedConfig,
+      currentUsage: usage,
+    });
+  });
+
+  app.post('/admin/quota/:clientId/reset', async (req, res) => {
+    const clientId = req.params.clientId;
+    await quotaManager.resetUsage(clientId);
     const usage = await quotaManager.getUsage(clientId);
     res.json({
+      message: '配额使用量已重置',
+      instanceId,
       clientId,
-      config,
-      usage,
+      currentUsage: usage,
+    });
+  });
+
+  app.get('/admin/templates', (_req, res) => {
+    res.json({
+      instanceId,
+      templates: TEMPLATES,
     });
   });
 
@@ -180,7 +248,7 @@ async function main() {
       value: Math.random(),
       timestamp: Date.now(),
     }));
-    res.json({ data, count: data.length });
+    res.json({ data, count: data.length, instanceId });
   });
 
   app.post('/api/upload', (req, res) => {
@@ -189,38 +257,47 @@ async function main() {
       status: 'received',
       receivedBytes: size,
       message: `已接收 ${size} 字节数据`,
+      instanceId,
     });
   });
 
   const PORT = process.env.PORT ?? 3000;
   app.listen(PORT, () => {
     console.log(`\n=== 配额管理系统示例服务已启动 ===`);
+    console.log(`实例 ID: ${instanceId}`);
     console.log(`服务地址: http://localhost:${PORT}`);
     console.log(`存储模式: ${quotaManager.getStoreMode()}`);
     console.log(`\n测试接口:`);
-    console.log(`  GET    http://localhost:${PORT}/health              - 健康检查（带配额状态，不消耗配额）`);
-    console.log(`  GET    http://localhost:${PORT}/api/usage           - 查看配额使用情况`);
-    console.log(`  GET    http://localhost:${PORT}/api/data            - 获取数据（受配额限制）`);
-    console.log(`  POST   http://localhost:${PORT}/api/upload          - 上传数据（计入流量）`);
-    console.log(`  GET    http://localhost:${PORT}/admin/quota/:id     - 查看客户端配额配置`);
-    console.log(`  PATCH  http://localhost:${PORT}/admin/quota/:id     - 调整客户端配额配置`);
+    console.log(`  GET    http://localhost:${PORT}/health                       - 健康检查（带配额状态，不消耗配额）`);
+    console.log(`  GET    http://localhost:${PORT}/api/usage                    - 查看当前客户端配额使用情况`);
+    console.log(`  GET    http://localhost:${PORT}/api/data                     - 获取数据（消耗配额+流量含响应体）`);
+    console.log(`  POST   http://localhost:${PORT}/api/upload                   - 上传数据（计入流量）`);
+    console.log(`  GET    http://localhost:${PORT}/admin/quota                  - 所有客户端配额汇总视图`);
+    console.log(`  GET    http://localhost:${PORT}/admin/quota/:id              - 查看单个客户端配额详情`);
+    console.log(`  PATCH  http://localhost:${PORT}/admin/quota/:id              - 调整配额（并发/速率/流量）`);
+    console.log(`  POST   http://localhost:${PORT}/admin/quota/:id/apply-template - 套用 free/vip/default/custom 模板`);
+    console.log(`  POST   http://localhost:${PORT}/admin/quota/:id/reset        - 重置客户端使用量`);
+    console.log(`  GET    http://localhost:${PORT}/admin/templates              - 查看预设配额模板`);
     console.log(`\n环境变量:`);
     console.log(`  QUOTA_STORE_MODE=local|redis    - 存储模式（默认 local）`);
     console.log(`  REDIS_URL=redis://...           - Redis 连接 URL`);
     console.log(`  REDIS_HOST/REDIS_PORT/...       - Redis 单独配置`);
+    console.log(`  REDIS_KEY_PREFIX=quota          - Redis key 前缀（多实例共用时需相同）`);
+    console.log(`  INSTANCE_ID=server-1            - 实例标识（默认 instance-<pid>）`);
     console.log(`  PORT=3000                       - 服务端口`);
+    console.log(`\nRedis 分布式多实例演示示例:`);
+    console.log(`  # 终端1: 启动实例 A（端口 3001）`);
+    console.log(`  REDIS_URL=redis://localhost:6379 REDIS_KEY_PREFIX=demo INSTANCE_ID=server-a PORT=3001 node dist/example.js`);
+    console.log(`  # 终端2: 启动实例 B（端口 3002）`);
+    console.log(`  REDIS_URL=redis://localhost:6379 REDIS_KEY_PREFIX=demo INSTANCE_ID=server-b PORT=3002 node dist/example.js`);
+    console.log(`  # 交替访问两个实例，观察配额一起消耗：`);
+    console.log(`  curl -s http://localhost:3001/api/usage -H "X-Client-Id: free-client" | jq .remaining.rate`);
+    console.log(`  curl -s http://localhost:3002/api/usage -H "X-Client-Id: free-client" | jq .remaining.rate`);
     console.log(`\n测试示例:`);
-    console.log(`  # 健康检查（不消耗配额，可看到当前配额状态）`);
-    console.log(`  curl -i -H "X-Client-Id: free-client" -H "X-Client-Tier: free" http://localhost:${PORT}/health`);
-    console.log(`  `);
-    console.log(`  # 正常请求（消耗配额）`);
-    console.log(`  curl -i -H "X-Client-Id: free-client" -H "X-Client-Tier: free" http://localhost:${PORT}/api/data`);
-    console.log(`  `);
-    console.log(`  # 调整 free-client 的 QPS 为 2`);
-    console.log(`  curl -X PATCH -H "Content-Type: application/json" -d '{"requestsPerSecond":2,"requestsBurst":5}' http://localhost:${PORT}/admin/quota/free-client`);
-    console.log(`  `);
-    console.log(`  # 压测触发 429，查看完整超限信息`);
-    console.log(`  for i in {1..20}; do curl -s -o /dev/null -w "%{http_code} " -H "X-Client-Id: free-client" -H "X-Client-Tier: free" http://localhost:${PORT}/api/data; done; echo`);
+    console.log(`  # 健康检查（不消耗配额）`);
+    console.log(`  curl -s http://localhost:${PORT}/health -H "X-Client-Tier: free" -H "X-Client-Id: free-client"`);
+    console.log(`  # 连续访问 10 次 api/data 观察小时流量额度递减：`);
+    console.log(`  for i in {1..10}; do curl -s http://localhost:${PORT}/api/usage -H "X-Client-Tier: free" -H "X-Client-Id: free-client" | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{const u=JSON.parse(d);console.log(u.remaining.trafficHour,'bytes left, ratio:',u.ratios.trafficHour.toFixed(4))})"; done`);
     console.log(``);
   });
 }
