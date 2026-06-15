@@ -44,9 +44,18 @@ export class LocalQuotaStore implements QuotaStore {
         lastAccess: Date.now(),
       };
       this.clients.set(clientId, state);
-    } else {
-      state.lastAccess = Date.now();
+      return state;
     }
+
+    state.lastAccess = Date.now();
+
+    const currentBurst = state.tokenBucket.getCapacity();
+    const currentRate = state.tokenBucket.getRefillRate();
+    if (currentBurst !== rateBurst || currentRate !== rateLimit) {
+      const remaining = state.tokenBucket.peekRemaining();
+      state.tokenBucket = new TokenBucket(rateBurst, rateLimit, Math.min(remaining, rateBurst));
+    }
+
     return state;
   }
 
@@ -66,6 +75,47 @@ export class LocalQuotaStore implements QuotaStore {
     return { current: newCount };
   }
 
+  private buildResultFromState(
+    clientId: string,
+    rateLimit: number,
+    rateBurst: number,
+    bytesPerHour: number,
+    bytesPerDay: number,
+    allowed: boolean,
+    blockedDimension?: string,
+    throttleDelayMs?: number,
+    retryAfterSec?: number,
+  ): ConsumeRequestResult {
+    const state = this.getOrCreateState(clientId, rateLimit, rateBurst);
+    const concurrentCurrent = this.concurrentCounts.get(clientId) ?? 0;
+    const { count: hourCount } = state.trafficHour.getApproximateCount();
+    const { count: dayCount } = state.trafficDay.getApproximateCount();
+    const rateRemaining = Math.floor(state.tokenBucket.peekRemaining());
+    const rateResetMs = state.tokenBucket.getResetTimeMs();
+
+    const rateRatio = (rateBurst - rateRemaining) / rateBurst;
+    const hourRatio = hourCount / bytesPerHour;
+    const dayRatio = dayCount / bytesPerDay;
+    const maxUsageRatio = Math.max(rateRatio, hourRatio, dayRatio);
+
+    return {
+      allowed,
+      blockedDimension,
+      throttleDelayMs,
+      concurrentCurrent,
+      concurrentLimit: 0,
+      rateRemaining,
+      rateLimit,
+      rateResetMs,
+      trafficHourRemaining: Math.max(0, bytesPerHour - hourCount),
+      trafficHourLimit: bytesPerHour,
+      trafficDayRemaining: Math.max(0, bytesPerDay - dayCount),
+      trafficDayLimit: bytesPerDay,
+      retryAfterSec,
+      maxUsageRatio,
+    };
+  }
+
   async consumeRequest(
     clientId: string,
     rateLimit: number,
@@ -75,28 +125,14 @@ export class LocalQuotaStore implements QuotaStore {
     payloadBytes: number = 0,
   ): Promise<ConsumeRequestResult> {
     const state = this.getOrCreateState(clientId, rateLimit, rateBurst);
-    const concurrentCurrent = this.concurrentCounts.get(clientId) ?? 0;
 
     const rateResult = state.tokenBucket.tryConsume(1);
     if (!rateResult.allowed) {
-      const { count: hourCount } = state.trafficHour.getApproximateCount();
-      const { count: dayCount } = state.trafficDay.getApproximateCount();
-      return {
-        allowed: false,
-        blockedDimension: 'requestsPerSecond',
-        throttleDelayMs: rateResult.waitTimeMs,
-        concurrentCurrent,
-        concurrentLimit: 0,
-        rateRemaining: Math.floor(rateResult.remaining),
-        rateLimit: rateLimit,
-        rateResetMs: state.tokenBucket.getResetTimeMs(),
-        trafficHourRemaining: Math.max(0, bytesPerHour - hourCount),
-        trafficHourLimit: bytesPerHour,
-        trafficDayRemaining: Math.max(0, bytesPerDay - dayCount),
-        trafficDayLimit: bytesPerDay,
-        retryAfterSec: Math.ceil(rateResult.waitTimeMs / 1000),
-        maxUsageRatio: 1,
-      };
+      return this.buildResultFromState(
+        clientId, rateLimit, rateBurst, bytesPerHour, bytesPerDay,
+        false, 'requestsPerSecond', rateResult.waitTimeMs,
+        Math.ceil(rateResult.waitTimeMs / 1000),
+      );
     }
 
     if (payloadBytes > 0) {
@@ -108,59 +144,38 @@ export class LocalQuotaStore implements QuotaStore {
     const { count: dayCount } = state.trafficDay.getApproximateCount();
 
     if (hourCount >= bytesPerHour) {
-      return {
-        allowed: false,
-        blockedDimension: 'bytesPerHour',
-        concurrentCurrent,
-        concurrentLimit: 0,
-        rateRemaining: Math.floor(rateResult.remaining),
-        rateLimit: rateLimit,
-        rateResetMs: state.tokenBucket.getResetTimeMs(),
-        trafficHourRemaining: 0,
-        trafficHourLimit: bytesPerHour,
-        trafficDayRemaining: Math.max(0, bytesPerDay - dayCount),
-        trafficDayLimit: bytesPerDay,
-        retryAfterSec: Math.ceil(state.trafficHour.getRemainingMs() / 1000),
-        maxUsageRatio: 1,
-      };
+      return this.buildResultFromState(
+        clientId, rateLimit, rateBurst, bytesPerHour, bytesPerDay,
+        false, 'bytesPerHour', undefined,
+        Math.ceil(state.trafficHour.getRemainingMs() / 1000),
+      );
     }
 
     if (dayCount >= bytesPerDay) {
-      return {
-        allowed: false,
-        blockedDimension: 'bytesPerDay',
-        concurrentCurrent,
-        concurrentLimit: 0,
-        rateRemaining: Math.floor(rateResult.remaining),
-        rateLimit: rateLimit,
-        rateResetMs: state.tokenBucket.getResetTimeMs(),
-        trafficHourRemaining: Math.max(0, bytesPerHour - hourCount),
-        trafficHourLimit: bytesPerHour,
-        trafficDayRemaining: 0,
-        trafficDayLimit: bytesPerDay,
-        retryAfterSec: Math.ceil(state.trafficDay.getRemainingMs() / 1000),
-        maxUsageRatio: 1,
-      };
+      return this.buildResultFromState(
+        clientId, rateLimit, rateBurst, bytesPerHour, bytesPerDay,
+        false, 'bytesPerDay', undefined,
+        Math.ceil(state.trafficDay.getRemainingMs() / 1000),
+      );
     }
 
-    const rateRatio = (rateBurst - rateResult.remaining) / rateBurst;
-    const hourRatio = hourCount / bytesPerHour;
-    const dayRatio = dayCount / bytesPerDay;
-    const maxUsageRatio = Math.max(rateRatio, hourRatio, dayRatio);
+    return this.buildResultFromState(
+      clientId, rateLimit, rateBurst, bytesPerHour, bytesPerDay,
+      true,
+    );
+  }
 
-    return {
-      allowed: true,
-      concurrentCurrent,
-      concurrentLimit: 0,
-      rateRemaining: Math.floor(rateResult.remaining),
-      rateLimit: rateLimit,
-      rateResetMs: state.tokenBucket.getResetTimeMs(),
-      trafficHourRemaining: Math.max(0, bytesPerHour - hourCount),
-      trafficHourLimit: bytesPerHour,
-      trafficDayRemaining: Math.max(0, bytesPerDay - dayCount),
-      trafficDayLimit: bytesPerDay,
-      maxUsageRatio,
-    };
+  async peekRequest(
+    clientId: string,
+    rateLimit: number,
+    rateBurst: number,
+    bytesPerHour: number,
+    bytesPerDay: number,
+  ): Promise<ConsumeRequestResult> {
+    return this.buildResultFromState(
+      clientId, rateLimit, rateBurst, bytesPerHour, bytesPerDay,
+      true,
+    );
   }
 
   async getCurrentUsage(clientId: string) {
@@ -169,8 +184,8 @@ export class LocalQuotaStore implements QuotaStore {
       return {
         concurrent: this.concurrentCounts.get(clientId) ?? 0,
         rateRemaining: 0,
-        trafficHourRemaining: 0,
-        trafficDayRemaining: 0,
+        trafficHourUsed: 0,
+        trafficDayUsed: 0,
       };
     }
     const { count: hourCount } = state.trafficHour.getApproximateCount();
@@ -178,8 +193,8 @@ export class LocalQuotaStore implements QuotaStore {
     return {
       concurrent: this.concurrentCounts.get(clientId) ?? 0,
       rateRemaining: Math.floor(state.tokenBucket.peekRemaining()),
-      trafficHourRemaining: Math.max(0, hourCount),
-      trafficDayRemaining: Math.max(0, dayCount),
+      trafficHourUsed: hourCount,
+      trafficDayUsed: dayCount,
     };
   }
 

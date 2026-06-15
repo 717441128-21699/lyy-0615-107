@@ -37,7 +37,9 @@ export interface QuotaResponseHeaders {
   'X-Quota-Rate-Limit': number;
   'X-Quota-Rate-Reset': number;
   'X-Quota-Traffic-Hour-Remaining': number;
+  'X-Quota-Traffic-Hour-Limit': number;
   'X-Quota-Traffic-Day-Remaining': number;
+  'X-Quota-Traffic-Day-Limit': number;
   'Retry-After'?: number;
 }
 

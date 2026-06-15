@@ -27,7 +27,7 @@ function defaultClientIdExtractor(req: Request): string {
 
   const ip = (req.headers['x-forwarded-for'] as string | undefined)?.split(',')[0].trim()
     || req.ip
-    || req.socket.remoteAddress
+    || (req.socket?.remoteAddress as string)
     || 'unknown';
   return `ip:${ip}`;
 }
@@ -41,6 +41,78 @@ function defaultPayloadBytesExtractor(req: Request): number {
     return Buffer.byteLength(req.body, 'utf-8');
   }
   return 0;
+}
+
+export interface QuotaStatusDetail {
+  current: number;
+  limit: number;
+  remaining: number;
+  ratio: number;
+  resetSec?: number;
+}
+
+export interface QuotaStatus {
+  concurrent: QuotaStatusDetail;
+  rate: QuotaStatusDetail;
+  trafficHour: QuotaStatusDetail;
+  trafficDay: QuotaStatusDetail;
+}
+
+export interface QuotaErrorResponse {
+  error: string;
+  code: 'QUOTA_EXCEEDED';
+  dimension: QuotaDimension;
+  message: string;
+  retryAfterSec: number;
+  usageRatio: number;
+  status: QuotaStatus;
+  suggestion: string[];
+  nextResetAt?: string;
+}
+
+export function buildQuotaStatusFromHeaders(
+  headers: Record<string, string | number | undefined>,
+): QuotaStatus {
+  const concurrentCurrent = Number(headers['X-Quota-Concurrent-Current'] ?? 0);
+  const concurrentLimit = Number(headers['X-Quota-Concurrent-Limit'] ?? 0);
+  const rateRemaining = Number(headers['X-Quota-Rate-Remaining'] ?? 0);
+  const rateLimit = Number(headers['X-Quota-Rate-Limit'] ?? 0);
+  const rateReset = Number(headers['X-Quota-Rate-Reset'] ?? 0);
+  const trafficHourRemaining = Number(headers['X-Quota-Traffic-Hour-Remaining'] ?? 0);
+  const trafficHourLimit = Number(headers['X-Quota-Traffic-Hour-Limit'] ?? 0);
+  const trafficDayRemaining = Number(headers['X-Quota-Traffic-Day-Remaining'] ?? 0);
+  const trafficDayLimit = Number(headers['X-Quota-Traffic-Day-Limit'] ?? 0);
+
+  const trafficHourCurrent = Math.max(0, trafficHourLimit - trafficHourRemaining);
+  const trafficDayCurrent = Math.max(0, trafficDayLimit - trafficDayRemaining);
+
+  return {
+    concurrent: {
+      current: concurrentCurrent,
+      limit: concurrentLimit,
+      remaining: Math.max(0, concurrentLimit - concurrentCurrent),
+      ratio: concurrentLimit > 0 ? concurrentCurrent / concurrentLimit : 0,
+    },
+    rate: {
+      current: rateLimit - rateRemaining,
+      limit: rateLimit,
+      remaining: rateRemaining,
+      ratio: rateLimit > 0 ? (rateLimit - rateRemaining) / rateLimit : 0,
+      resetSec: rateReset,
+    },
+    trafficHour: {
+      current: trafficHourCurrent,
+      limit: trafficHourLimit,
+      remaining: trafficHourRemaining,
+      ratio: trafficHourLimit > 0 ? trafficHourCurrent / trafficHourLimit : 0,
+    },
+    trafficDay: {
+      current: trafficDayCurrent,
+      limit: trafficDayLimit,
+      remaining: trafficDayRemaining,
+      ratio: trafficDayLimit > 0 ? trafficDayCurrent / trafficDayLimit : 0,
+    },
+  };
 }
 
 export function createQuotaMiddleware(options: QuotaMiddlewareOptions) {
@@ -85,26 +157,23 @@ export function createQuotaMiddleware(options: QuotaMiddlewareOptions) {
           ? BLOCK_MESSAGES[result.blockedDimension]
           : '请求被拒绝，请稍后再试';
 
-        res.status(429).json({
+        const status = buildQuotaStatusFromHeaders(headers);
+        const suggestion = buildSuggestion(result.blockedDimension, headers);
+        const retryAfterSec = result.retryAfterSec ?? 1;
+
+        const response: QuotaErrorResponse = {
           error: 'Too Many Requests',
           code: 'QUOTA_EXCEEDED',
-          dimension: result.blockedDimension,
+          dimension: result.blockedDimension!,
           message,
-          retryAfterSec: result.retryAfterSec ?? 1,
-          detail: {
-            usageRatio: result.usageRatio,
-            concurrent: {
-              current: headers['X-Quota-Concurrent-Current'],
-              limit: headers['X-Quota-Concurrent-Limit'],
-            },
-            rate: {
-              remaining: headers['X-Quota-Rate-Remaining'],
-              limit: headers['X-Quota-Rate-Limit'],
-              resetSec: headers['X-Quota-Rate-Reset'],
-            },
-          },
-          suggestion: buildSuggestion(result.blockedDimension, headers),
-        });
+          retryAfterSec,
+          usageRatio: result.usageRatio,
+          status,
+          suggestion,
+          nextResetAt: new Date(Date.now() + retryAfterSec * 1000).toISOString(),
+        };
+
+        res.status(429).json(response);
         return;
       }
 

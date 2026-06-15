@@ -104,7 +104,7 @@ describe('LocalQuotaStore', () => {
 
       const usage = await store.getCurrentUsage('client-1');
       expect(usage.concurrent).toBe(0);
-      expect(usage.trafficHourRemaining).toBe(0);
+      expect(usage.trafficHourUsed).toBe(0);
     });
   });
 

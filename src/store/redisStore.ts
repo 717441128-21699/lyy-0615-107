@@ -63,6 +63,36 @@ end
 return {allowed, wait_ms, current_tokens, reset_ms}
 `;
 
+const TOKEN_BUCKET_PEEK_SCRIPT = `
+local tokens_key = KEYS[1]
+local refill_key = KEYS[2]
+local capacity = tonumber(ARGV[1])
+local refill_rate = tonumber(ARGV[2])
+local now = tonumber(ARGV[3])
+
+local last_refill = redis.call('GET', refill_key)
+if last_refill == false then last_refill = now end
+last_refill = tonumber(last_refill)
+
+local current_tokens = redis.call('GET', tokens_key)
+if current_tokens == false then current_tokens = capacity end
+current_tokens = tonumber(current_tokens)
+
+local elapsed = (now - last_refill) / 1000
+if elapsed > 0 then
+  local new_tokens = elapsed * refill_rate
+  current_tokens = math.min(capacity, current_tokens + new_tokens)
+end
+
+local reset_ms = 0
+local token_deficit = capacity - current_tokens
+if token_deficit > 0 then
+  reset_ms = math.ceil(token_deficit / refill_rate) * 1000
+end
+
+return {current_tokens, reset_ms}
+`;
+
 export class RedisQuotaStore implements QuotaStore {
   readonly mode = 'distributed' as const;
   private readonly client: RedisType;
@@ -159,6 +189,29 @@ export class RedisQuotaStore implements QuotaStore {
     } catch (e) {
       return { current: 0 };
     }
+  }
+
+  private async sumTrafficBuckets(key: string, maxBuckets: number, currentBucket: number): Promise<number> {
+    try {
+      const data = await this.client.hgetall(key);
+      const cutoff = currentBucket - maxBuckets;
+      let total = 0;
+      for (const [bucket, value] of Object.entries(data)) {
+        const bucketNum = parseInt(bucket, 10);
+        if (bucketNum >= cutoff) {
+          total += parseInt(value, 10) || 0;
+        }
+      }
+      return total;
+    } catch (e) {
+      return 0;
+    }
+  }
+
+  private getRemainingMs(windowMs: number, currentBucket: number, bucketMs: number): number {
+    const windowStartBucket = currentBucket - Math.floor(windowMs / bucketMs);
+    const expiresAt = (windowStartBucket + 1) * bucketMs;
+    return Math.max(0, expiresAt - Date.now());
   }
 
   async consumeRequest(
@@ -304,27 +357,71 @@ export class RedisQuotaStore implements QuotaStore {
     }
   }
 
-  private async sumTrafficBuckets(key: string, maxBuckets: number, currentBucket: number): Promise<number> {
-    try {
-      const data = await this.client.hgetall(key);
-      const cutoff = currentBucket - maxBuckets;
-      let total = 0;
-      for (const [bucket, value] of Object.entries(data)) {
-        const bucketNum = parseInt(bucket, 10);
-        if (bucketNum >= cutoff) {
-          total += parseInt(value, 10) || 0;
-        }
-      }
-      return total;
-    } catch (e) {
-      return 0;
-    }
-  }
+  async peekRequest(
+    clientId: string,
+    rateLimit: number,
+    rateBurst: number,
+    bytesPerHour: number,
+    bytesPerDay: number,
+  ): Promise<ConsumeRequestResult> {
+    const tokensKey = KEYS.tokens(this.keyPrefix, clientId);
+    const refillKey = KEYS.tokensRefill(this.keyPrefix, clientId);
+    const trafficHourKey = KEYS.trafficHour(this.keyPrefix, clientId);
+    const trafficDayKey = KEYS.trafficDay(this.keyPrefix, clientId);
+    const now = Date.now();
+    const currentHourBucket = Math.floor(now / 10_000);
+    const currentDayBucket = Math.floor(now / 60_000);
 
-  private getRemainingMs(windowMs: number, currentBucket: number, bucketMs: number): number {
-    const windowStartBucket = currentBucket - Math.floor(windowMs / bucketMs);
-    const expiresAt = (windowStartBucket + 1) * bucketMs;
-    return Math.max(0, expiresAt - Date.now());
+    try {
+      const tokenPeek = await this.client.eval(
+        TOKEN_BUCKET_PEEK_SCRIPT,
+        2,
+        tokensKey,
+        refillKey,
+        rateBurst.toString(),
+        rateLimit.toString(),
+        now.toString(),
+      ) as [number, number];
+
+      const remaining = tokenPeek[0];
+      const resetMs = tokenPeek[1];
+
+      const hourCount = await this.sumTrafficBuckets(trafficHourKey, 360, currentHourBucket);
+      const dayCount = await this.sumTrafficBuckets(trafficDayKey, 1440, currentDayBucket);
+
+      const rateRatio = (rateBurst - remaining) / rateBurst;
+      const hourRatio = hourCount / bytesPerHour;
+      const dayRatio = dayCount / bytesPerDay;
+      const maxUsageRatio = Math.max(rateRatio, hourRatio, dayRatio);
+
+      return {
+        allowed: true,
+        concurrentCurrent: 0,
+        concurrentLimit: 0,
+        rateRemaining: Math.floor(remaining),
+        rateLimit,
+        rateResetMs: resetMs,
+        trafficHourRemaining: Math.max(0, bytesPerHour - hourCount),
+        trafficHourLimit: bytesPerHour,
+        trafficDayRemaining: Math.max(0, bytesPerDay - dayCount),
+        trafficDayLimit: bytesPerDay,
+        maxUsageRatio,
+      };
+    } catch (e) {
+      return {
+        allowed: true,
+        concurrentCurrent: 0,
+        concurrentLimit: 0,
+        rateRemaining: rateBurst,
+        rateLimit,
+        rateResetMs: 0,
+        trafficHourRemaining: bytesPerHour,
+        trafficHourLimit: bytesPerHour,
+        trafficDayRemaining: bytesPerDay,
+        trafficDayLimit: bytesPerDay,
+        maxUsageRatio: 0,
+      };
+    }
   }
 
   async getCurrentUsage(clientId: string) {
@@ -342,15 +439,15 @@ export class RedisQuotaStore implements QuotaStore {
       return {
         concurrent,
         rateRemaining: tokens,
-        trafficHourRemaining: hourCount,
-        trafficDayRemaining: dayCount,
+        trafficHourUsed: hourCount,
+        trafficDayUsed: dayCount,
       };
     } catch (e) {
       return {
         concurrent: 0,
         rateRemaining: 0,
-        trafficHourRemaining: 0,
-        trafficDayRemaining: 0,
+        trafficHourUsed: 0,
+        trafficDayUsed: 0,
       };
     }
   }

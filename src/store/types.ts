@@ -49,11 +49,18 @@ export interface QuotaStore {
     bytesPerDay: number,
     payloadBytes?: number,
   ): Promise<ConsumeRequestResult>;
+  peekRequest(
+    clientId: string,
+    rateLimit: number,
+    rateBurst: number,
+    bytesPerHour: number,
+    bytesPerDay: number,
+  ): Promise<ConsumeRequestResult>;
   getCurrentUsage(clientId: string): Promise<{
     concurrent: number;
     rateRemaining: number;
-    trafficHourRemaining: number;
-    trafficDayRemaining: number;
+    trafficHourUsed: number;
+    trafficDayUsed: number;
   }>;
   resetClient(clientId: string): Promise<void>;
   cleanup(): Promise<void>;

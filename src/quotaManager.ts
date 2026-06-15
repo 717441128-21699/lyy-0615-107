@@ -19,6 +19,8 @@ export interface QuotaManagerOptions {
   onDegrade?: (clientId: string, usageRatio: number, delayMs: number) => void;
 }
 
+export type UpdateQuotaPatch = Partial<Omit<ClientQuotaConfig, 'clientId'>>;
+
 export class QuotaManager {
   private readonly store: QuotaStore;
   private readonly strategy: QuotaStrategyConfig;
@@ -44,6 +46,13 @@ export class QuotaManager {
     });
   }
 
+  updateClientConfig(clientId: string, patch: UpdateQuotaPatch): ClientQuotaConfig {
+    const existing = this.getClientConfig(clientId);
+    const updated = { ...existing, ...patch };
+    this.clientConfigs.set(clientId, updated);
+    return updated;
+  }
+
   getClientConfig(clientId: string): ClientQuotaConfig {
     return this.clientConfigs.get(clientId) ?? {
       ...this.defaultConfig,
@@ -66,7 +75,9 @@ export class QuotaManager {
       'X-Quota-Rate-Limit': result.rateLimit,
       'X-Quota-Rate-Reset': resetSeconds,
       'X-Quota-Traffic-Hour-Remaining': result.trafficHourRemaining,
+      'X-Quota-Traffic-Hour-Limit': result.trafficHourLimit,
       'X-Quota-Traffic-Day-Remaining': result.trafficDayRemaining,
+      'X-Quota-Traffic-Day-Limit': result.trafficDayLimit,
       'Retry-After': result.retryAfterSec,
     };
   }
@@ -116,7 +127,9 @@ export class QuotaManager {
           'X-Quota-Rate-Limit': config.requestsPerSecond,
           'X-Quota-Rate-Reset': 1,
           'X-Quota-Traffic-Hour-Remaining': 0,
+          'X-Quota-Traffic-Hour-Limit': config.bytesPerHour,
           'X-Quota-Traffic-Day-Remaining': 0,
+          'X-Quota-Traffic-Day-Limit': config.bytesPerDay,
           'Retry-After': 1,
         },
         action: 'reject',
@@ -170,6 +183,46 @@ export class QuotaManager {
     };
   }
 
+  async peekUsage(
+    clientId: string,
+  ): Promise<{
+    allowed: boolean;
+    usageRatio: number;
+    headers: QuotaResponseHeaders;
+  }> {
+    const config = this.getClientConfig(clientId);
+
+    const peekResult = await this.store.peekRequest(
+      clientId,
+      config.requestsPerSecond,
+      config.requestsBurst,
+      config.bytesPerHour,
+      config.bytesPerDay,
+    );
+
+    const currentConcurrent = (await this.store.getCurrentUsage(clientId)).concurrent;
+    const concurrentRatio = config.maxConcurrentConnections > 0
+      ? currentConcurrent / config.maxConcurrentConnections
+      : 0;
+
+    const usageRatio = Math.max(peekResult.maxUsageRatio, concurrentRatio);
+
+    const headers = this.buildHeaders(clientId, config, {
+      ...peekResult,
+      concurrentCurrent: currentConcurrent,
+    }, {
+      acquired: currentConcurrent < config.maxConcurrentConnections,
+      current: currentConcurrent,
+      limit: config.maxConcurrentConnections,
+    });
+
+    return {
+      allowed: peekResult.allowed && currentConcurrent < config.maxConcurrentConnections,
+      usageRatio,
+      headers,
+    };
+  }
+
   async releaseConnection(clientId: string): Promise<void> {
     await this.store.releaseConnection(clientId);
   }
@@ -184,6 +237,12 @@ export class QuotaManager {
     return {
       config,
       usage,
+      remaining: {
+        concurrent: Math.max(0, config.maxConcurrentConnections - usage.concurrent),
+        rate: usage.rateRemaining,
+        trafficHour: Math.max(0, config.bytesPerHour - usage.trafficHourUsed),
+        trafficDay: Math.max(0, config.bytesPerDay - usage.trafficDayUsed),
+      },
       ratios: {
         concurrent: config.maxConcurrentConnections > 0
           ? usage.concurrent / config.maxConcurrentConnections
@@ -192,10 +251,10 @@ export class QuotaManager {
           ? (config.requestsBurst - usage.rateRemaining) / config.requestsBurst
           : 0,
         trafficHour: config.bytesPerHour > 0
-          ? usage.trafficHourRemaining / config.bytesPerHour
+          ? usage.trafficHourUsed / config.bytesPerHour
           : 0,
         trafficDay: config.bytesPerDay > 0
-          ? usage.trafficDayRemaining / config.bytesPerDay
+          ? usage.trafficDayUsed / config.bytesPerDay
           : 0,
       },
     };
